@@ -57,7 +57,10 @@ function main(): void {
     const loggedAt = freshness.get(s.id);
     if (loggedAt !== undefined) {
       // Known session: re-run the writer only if the session changed after logging.
-      if (typeof s.updated !== "number" || s.updated <= loggedAt) continue;
+      // Unit normalization: opencode `updated` is ms, but tolerate seconds.
+      const updatedMs =
+        typeof s.updated === "number" ? (s.updated < 1e12 ? s.updated * 1000 : s.updated) : NaN;
+      if (!Number.isFinite(updatedMs) || updatedMs <= loggedAt) continue;
       log(`re-queue stale episode for ${s.id}`);
     }
     try {

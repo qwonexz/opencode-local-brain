@@ -388,8 +388,11 @@ export class Brain {
       if (!pushBlock(block)) break;
     }
     // The plugin wraps this in <local-brain>…</local-brain>: neutralize any
-    // stored closing tag so memory content cannot break out of the wrapper.
-    return blocks.join("\n\n").replace(/<\/local-brain/gi, "<\\/local-brain");
+    // stored tag that could break out of the wrapper (open/close, any case,
+    // stray whitespace). "local-brain" alone is harmless; brackets are not.
+    return blocks
+      .join("\n\n")
+      .replace(/<(\/?\s*)local-brain/gi, "<\\$1local-brain");
   }
 }
 

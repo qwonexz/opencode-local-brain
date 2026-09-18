@@ -10,7 +10,7 @@
  * Guards: skips own "brain-writer:" sessions, trivial sessions (<2 user
  * messages or <200 chars of transcript), missing sessions.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   appendFileSync,
   closeSync,
@@ -18,9 +18,11 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -42,7 +44,7 @@ const MIN_TRANSCRIPT_CHARS = 200;
 const MAX_TRANSCRIPT_CHARS = 30_000;
 
 function log(msg: string): void {
-  mkdirSync(BRAIN_DIR, { recursive: true });
+  mkdirSync(BRAIN_DIR, { recursive: true, mode: 0o700 });
   appendFileSync(LOG_PATH, `${new Date().toISOString()} ${msg}\n`);
 }
 
@@ -59,17 +61,19 @@ function run(cmd: string, args: string[], input?: string, timeoutMs = 300_000): 
 
 /**
  * Secure temp file: O_CREAT|O_EXCL (no symlink following, no clobbering),
- * mode 0600 (transcripts may contain secrets). Returns path; caller unlinks.
+ * mode 0600 (transcripts may contain secrets). Content is written through
+ * the SAME fd (writeSync) — no TOCTOU window between create and write.
+ * Returns {path, fd}; caller must closeSync(fd) + unlink when done.
  */
-function secureTempFile(prefix: string, suffix: string): string {
+function secureTempFile(prefix: string, suffix: string): { path: string; fd: number } {
   mkdirSync(BRAIN_DIR, { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 10; attempt++) {
-    const name = `${prefix}-${process.pid}-${Date.now()}-${attempt}${suffix}`;
+    const rand = Math.floor(Math.random() * 0xffffffff).toString(16);
+    const name = `${prefix}-${process.pid}-${Date.now()}-${rand}${suffix}`;
     const full = join(BRAIN_DIR, name);
     try {
       const fd = openSync(full, "wx", 0o600);
-      closeSync(fd);
-      return full;
+      return { path: full, fd };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
@@ -86,8 +90,9 @@ function cleanStaleTempFiles(): void {
     return;
   }
   const now = Date.now();
+  // Matches secureTempFile() names: writer-<pid>-<ts>-<rand>.txt, export-<pid>-<ts>-<rand>.json
   for (const e of entries) {
-    if (!/^(writer|export)-ses_[A-Za-z0-9]+(-\d+){2,3}(\.txt|\.json)?$/.test(e)) continue;
+    if (!/^(writer|export)-\d+-\d+-[0-9a-f]+\.(txt|json)$/.test(e)) continue;
     const full = join(BRAIN_DIR, e);
     try {
       const age = now - statSync(full).mtimeMs;
@@ -147,9 +152,11 @@ function registerWriterTitle(title: string): void {
   try {
     const reg = loadWriterRegistry();
     reg.add(title);
-    // cap size: keep last 200
+    // cap size: keep last 200. Atomic write (tmp + rename) against races.
     const arr = [...reg].slice(-200);
-    writeFileSync(REGISTRY_PATH, JSON.stringify(arr), { encoding: "utf-8", mode: 0o600 });
+    const tmp = `${REGISTRY_PATH}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(arr), { encoding: "utf-8", mode: 0o600 });
+    renameSync(tmp, REGISTRY_PATH);
   } catch {
     // best-effort
   }
@@ -157,11 +164,14 @@ function registerWriterTitle(title: string): void {
 
 function parseWriterJson(raw: string): WriterOutput {
   // opencode run --format json emits event lines; the assistant text holds JSON.
-  // Strategy: find the largest {...} block.
+  // Strategy: find the largest {...} block. Reviver drops __proto__ keys at
+  // ALL levels (prototype-pollution hygiene for model-controlled input).
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
   if (start === -1 || end <= start) throw new Error("No JSON object in writer output");
-  return JSON.parse(raw.slice(start, end + 1)) as WriterOutput;
+  return JSON.parse(raw.slice(start, end + 1), (key, value) =>
+    key === "__proto__" ? undefined : value
+  ) as WriterOutput;
 }
 
 const WRITER_PROMPT = `Ты — писарь локальной памяти опенкод-агента. Ниже транскрипт сессии.
@@ -207,15 +217,26 @@ async function main(): Promise<void> {
   // useless for summarization. Secrets in the transcript never reach the DB:
   // writer output passes assertNoSecrets per item, and the temp writer
   // session is deleted right after (cleanupWriterSession).
-  // NOTE 2: `opencode export` truncates JSON when stdout is a pipe — redirect
-  // to a temp file instead. sessionId is regex-validated, safe to interpolate.
-  const exportTmp = secureTempFile("export", ".json");
+  // NOTE 2: `opencode export` truncates JSON when stdout is a pipe — write
+  // directly to the O_EXCL temp fd via spawnSync stdio (no shell involved).
+  const expTmp = secureTempFile("export", ".json");
+  let rawExport: string;
   try {
-    run("bash", ["-c", `'${OPENCODE_BIN}' export '${sessionId}' > '${exportTmp}'`], undefined, 60_000);
-    var rawExport = readFileSync(exportTmp, "utf-8");
+    const res = spawnSync(OPENCODE_BIN, ["export", sessionId], {
+      cwd: homedir(),
+      timeout: 60_000,
+      stdio: ["ignore", expTmp.fd, "pipe"],
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    closeSync(expTmp.fd);
+    if (res.error) throw res.error;
+    if (res.status !== 0) {
+      throw new Error(`opencode export failed (status ${res.status}): ${String(res.stderr).slice(0, 200)}`);
+    }
+    rawExport = readFileSync(expTmp.path, "utf-8");
   } finally {
     try {
-      unlinkSync(exportTmp);
+      unlinkSync(expTmp.path);
     } catch {
       // best-effort cleanup
     }
@@ -235,9 +256,13 @@ async function main(): Promise<void> {
   // Transcript goes via -f attachment (message MUST come first on the CLI,
   // otherwise -f swallows it). The model reads attachments fine.
   const tmp = secureTempFile("writer", ".txt");
-  writeFileSync(tmp, `${WRITER_PROMPT}\n\n--- ТРАНСКРИПТ ---\n${text}`, { encoding: "utf-8", mode: 0o600 });
+  writeSync(tmp.fd, `${WRITER_PROMPT}\n\n--- ТРАНСКРИПТ ---\n${text}`, null, "utf-8");
+  closeSync(tmp.fd);
   let out: string;
   try {
+    // Claim the title BEFORE running: parallel writers for the same session
+    // see the registry and back off (race-safe enough for a best-effort daemon).
+    registerWriterTitle(`${WRITER_TITLE_PREFIX} ${sessionId}`);
     out = run(
       OPENCODE_BIN,
       [
@@ -248,24 +273,22 @@ async function main(): Promise<void> {
         "--title",
         `${WRITER_TITLE_PREFIX} ${sessionId}`,
         "-f",
-        tmp,
+        tmp.path,
       ],
       undefined,
       300_000
     );
-    registerWriterTitle(`${WRITER_TITLE_PREFIX} ${sessionId}`);
   } finally {
     try {
-      unlinkSync(tmp);
+      unlinkSync(tmp.path);
     } catch {
       // best-effort cleanup
     }
   }
 
   const data = parseWriterJson(out);
-  // Strip prototype-pollution keys from model output before use.
+  // Defense in depth: per-item caps even if parseWriterJson limits change.
   if (data && typeof data === "object") {
-    for (const k of ["__proto__", "constructor", "prototype"]) delete (data as Record<string, unknown>)[k];
     if (Array.isArray(data.facts)) data.facts = data.facts.slice(0, MAX_FACTS_PER_SESSION);
     if (Array.isArray(data.mistakes)) data.mistakes = data.mistakes.slice(0, MAX_RULES_PER_SESSION);
   }
