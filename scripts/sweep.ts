@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { Brain } from "../src/index.js";
 
 const BRAIN_DIR = join(homedir(), ".config", "opencode", "brain");
+const OPENCODE_BIN = join(homedir(), ".opencode", "bin", "opencode");
 const DB_PATH = process.env.BRAIN_DB ?? join(BRAIN_DIR, "brain.db");
 const LOG_PATH = join(BRAIN_DIR, "writer.log");
 const WRITER_JS = join(homedir(), "Projects", "opencode-local-brain", "dist", "scripts", "writer.js");
@@ -33,8 +34,9 @@ interface ListedSession {
 }
 
 function main(): void {
-  const raw = execFileSync("opencode", ["session", "list", "--format", "json", "-n", String(MAX_SESSIONS)], {
+  const raw = execFileSync(OPENCODE_BIN, ["session", "list", "--format", "json", "-n", String(MAX_SESSIONS)], {
     encoding: "utf-8",
+    cwd: homedir(),
     timeout: 60_000,
   });
   const sessions = JSON.parse(raw) as ListedSession[];

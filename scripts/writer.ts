@@ -18,6 +18,7 @@ import { Brain } from "../src/index.js";
 import { isSecretLike } from "../src/secrets.js";
 
 const BRAIN_DIR = join(homedir(), ".config", "opencode", "brain");
+const OPENCODE_BIN = join(homedir(), ".opencode", "bin", "opencode");
 const DB_PATH = process.env.BRAIN_DB ?? join(BRAIN_DIR, "brain.db");
 const LOG_PATH = join(BRAIN_DIR, "writer.log");
 const WRITER_MODEL = process.env.BRAIN_WRITER_MODEL ?? "opencode/big-pickle";
@@ -35,6 +36,7 @@ function log(msg: string): void {
 function run(cmd: string, args: string[], input?: string, timeoutMs = 300_000): string {
   return execFileSync(cmd, args, {
     encoding: "utf-8",
+    cwd: homedir(), // session list/export are cwd-scoped; pin to $HOME
     timeout: timeoutMs,
     maxBuffer: 32 * 1024 * 1024,
     input,
@@ -99,11 +101,11 @@ const WRITER_PROMPT = `Ты — писарь локальной памяти о�
  * may contain secrets from the summarized session) don't linger on disk. */
 function cleanupWriterSession(sessionId: string): void {
   try {
-    const raw = run("opencode", ["session", "list", "--format", "json", "-n", "10"], undefined, 60_000);
+    const raw = run(OPENCODE_BIN, ["session", "list", "--format", "json", "-n", "10"], undefined, 60_000);
     const sessions = JSON.parse(raw) as { id?: string; title?: string }[];
     for (const s of sessions) {
       if (typeof s.id === "string" && s.title === `${WRITER_TITLE_PREFIX} ${sessionId}`) {
-        run("opencode", ["session", "delete", s.id], undefined, 30_000);
+        run(OPENCODE_BIN, ["session", "delete", s.id], undefined, 30_000);
         log(`${sessionId}: temp writer session ${s.id} deleted`);
       }
     }
@@ -126,7 +128,7 @@ async function main(): Promise<void> {
   // to a temp file instead. sessionId is regex-validated, safe to interpolate.
   const exportTmp = join(BRAIN_DIR, `export-${sessionId}.json`);
   try {
-    run("bash", ["-c", `opencode export '${sessionId}' > '${exportTmp}'`], undefined, 60_000);
+    run("bash", ["-c", `'${OPENCODE_BIN}' export '${sessionId}' > '${exportTmp}'`], undefined, 60_000);
     var rawExport = readFileSync(exportTmp, "utf-8");
   } finally {
     try {
