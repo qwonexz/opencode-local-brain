@@ -10,6 +10,7 @@
  * Guards: skips own "brain-writer:" sessions, trivial sessions (<2 user
  * messages or <200 chars of transcript), missing sessions.
  */
+import { randomBytes } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -68,7 +69,7 @@ function run(cmd: string, args: string[], input?: string, timeoutMs = 300_000): 
 function secureTempFile(prefix: string, suffix: string): { path: string; fd: number } {
   mkdirSync(BRAIN_DIR, { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 10; attempt++) {
-    const rand = Math.floor(Math.random() * 0xffffffff).toString(16);
+    const rand = randomBytes(8).toString("hex");
     const name = `${prefix}-${process.pid}-${Date.now()}-${rand}${suffix}`;
     const full = join(BRAIN_DIR, name);
     try {

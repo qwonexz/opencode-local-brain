@@ -23,7 +23,7 @@ const ACTIVE_GRACE_MS = 10 * 60 * 1000;
 const MAX_SESSIONS = 30;
 
 function log(msg: string): void {
-  mkdirSync(BRAIN_DIR, { recursive: true });
+  mkdirSync(BRAIN_DIR, { recursive: true, mode: 0o700 });
   appendFileSync(LOG_PATH, `${new Date().toISOString()} [sweep] ${msg}\n`);
 }
 
