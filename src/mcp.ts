@@ -19,19 +19,49 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep, relative, isAbsolute } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync } from "node:fs";
 import { z } from "zod";
 import { Brain } from "./index.js";
+import { isSecretLike } from "./secrets.js";
 
 const BRAIN_DIR = join(homedir(), ".config", "opencode", "brain") + sep;
 
 function resolveDbPath(raw: string): string {
   if (raw === ":memory:") return raw;
-  const resolved = resolve(raw);
-  if (!resolved.startsWith(BRAIN_DIR)) {
-    throw new Error(`BRAIN_DB must be inside ${BRAIN_DIR} (got ${resolved})`);
+  if (!isAbsolute(raw)) {
+    throw new Error("BRAIN_DB must be an absolute path or :memory:");
   }
-  return resolved;
+  const resolved = resolve(raw);
+  // realpath both sides: resolve() alone does not see symlinks, so a
+  // symlink inside the brain dir pointing outside would pass a naive check.
+  mkdirSync(BRAIN_DIR, { recursive: true });
+  const base = realpathSync(BRAIN_DIR);
+  let target = resolved;
+  try {
+    const st = lstatSync(resolved);
+    if (st.isSymbolicLink()) {
+      // Link itself exists (target may not): resolve the link, not the target.
+      target = resolve(dirname(resolved), readlinkSync(resolved));
+    } else if (st.isFile() || st.isDirectory()) {
+      target = realpathSync(resolved);
+    }
+  } catch {
+    target = resolved; // missing file: parent check below still applies
+  }
+  let parent = dirname(target);
+  try {
+    if (existsSync(parent)) parent = realpathSync(parent);
+  } catch {
+    parent = dirname(target);
+  }
+  const relTarget = relative(base, target);
+  const relParent = relative(base, parent);
+  const inside = (rel: string): boolean => rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  if (!inside(relTarget) || !inside(relParent)) {
+    throw new Error("BRAIN_DB must be inside the brain directory");
+  }
+  return target;
 }
 
 const DB_PATH = resolveDbPath(process.env.BRAIN_DB ?? join(BRAIN_DIR, "brain.db"));
@@ -45,10 +75,12 @@ function withBrain<T>(fn: (brain: Brain) => T): T {
   }
 }
 
-/** Strip $HOME from error text — never leak absolute paths to clients. */
+/** Strip paths and secret-like content — never leak them to clients. */
 function sanitizeError(err: unknown): string {
-  const msg = err instanceof Error ? err.message : "Unknown error";
-  return msg.split(homedir()).join("~").slice(0, 500);
+  let msg = err instanceof Error ? err.message : "Unknown error";
+  msg = msg.split(homedir()).join("~").split(DB_PATH).join("<brain.db>");
+  if (isSecretLike(msg)) return "Rejected: error details withheld (suspicious content).";
+  return msg.slice(0, 500);
 }
 
 function ok(text: string): { content: [{ type: "text"; text: string }] } {

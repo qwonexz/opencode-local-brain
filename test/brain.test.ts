@@ -164,6 +164,29 @@ describe("secret rejection", () => {
       () => brain.addRule({ title: "T", mistake: "leaked", rule: "bot token = AAAAABBBBBCCCCC" }),
       /rejected/
     );
+    assert.throws(
+      () => brain.addRule({ title: "T", mistake: "M", rule: "R", cause: "api_key=12345678901234567890" }),
+      /rejected/
+    );
+    assert.throws(
+      () => brain.addRule({ title: "T", mistake: "M", rule: "R", triggers: "my password is x" }),
+      /rejected/
+    );
+    assert.throws(
+      () => brain.logEpisode({ sessionId: "sess apikey 1234567890123456789012345", summary: "ok" }),
+      /rejected/
+    );
+  });
+
+  it("duplicate episode error does not echo sessionId", () => {
+    brain.logEpisode({ sessionId: "dup-session", summary: "one" });
+    assert.throws(
+      () => brain.logEpisode({ sessionId: "dup-session", summary: "two" }),
+      (err: unknown) =>
+        err instanceof Error &&
+        /already exists/.test(err.message) &&
+        !err.message.includes("dup-session")
+    );
   });
 
   it("accepts legit account facts", () => {

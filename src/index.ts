@@ -107,6 +107,7 @@ export class Brain {
 
   logEpisode(input: NewEpisode): number {
     const sessionId = requireText(input.sessionId, "sessionId", LIMITS.sessionId);
+    assertNoSecrets(sessionId, "sessionId");
     const summary = requireText(input.summary, "summary", LIMITS.summary);
     assertNoSecrets(summary, "summary");
     const startedAt = optionalDate(input.startedAt, "startedAt");
@@ -130,7 +131,8 @@ export class Brain {
         err instanceof Error &&
         (err as Error & { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE"
       ) {
-        throw new Error(`Episode for session '${sessionId}' already exists`);
+        // Never echo the sessionId: it may itself be sensitive.
+        throw new Error("Episode for this session already exists");
       }
       throw err;
     }
@@ -202,10 +204,10 @@ export class Brain {
     const title = requireText(input.title, "title", LIMITS.ruleTitle);
     const mistake = requireText(input.mistake, "mistake", LIMITS.ruleMistake);
     const rule = requireText(input.rule, "rule", LIMITS.ruleText);
-    assertNoSecrets(`${title}\n${mistake}\n${rule}`, "rule");
     const cause = input.cause === undefined ? null : requireText(input.cause, "cause", LIMITS.ruleCause);
     const triggers =
       input.triggers === undefined ? null : requireText(input.triggers, "triggers", LIMITS.ruleTriggers);
+    assertNoSecrets(`${title}\n${mistake}\n${cause ?? ""}\n${rule}\n${triggers ?? ""}`, "rule");
     const info = this.db
       .prepare(
         "INSERT INTO rules (title, mistake, cause, rule, triggers, confirmed) VALUES (?, ?, ?, ?, ?, ?)"
