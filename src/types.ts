@@ -100,13 +100,19 @@ export function isFactCategory(value: unknown): value is FactCategory {
   return typeof value === "string" && VALID_CATEGORIES.has(value);
 }
 
-/** Normalize text: NFKC, strip control/format chars (incl. RTL overrides), collapse whitespace. */
+/** Normalize text: NFKC, strip control/format chars (keeping ZWJ for emoji), collapse whitespace. */
 export function normalizeText(value: string): string {
-  return value
-    .normalize("NFKC")
-    .replace(/[\p{Cc}\p{Cf}]/gu, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const ZWJ = "\u200D";
+  const GUARD = "\uE000";
+  const strip = (s: string): string =>
+    s
+      .normalize("NFKC")
+      .replace(/[\p{Cc}\p{Cf}]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  if (!value.includes(ZWJ)) return strip(value);
+  if (value.includes(GUARD)) return strip(value); // ultra-rare: drop ZWJ rather than corrupt PUA
+  return strip(value.split(ZWJ).join(GUARD)).split(GUARD).join(ZWJ);
 }
 
 /** Normalized identity for fact dedup: NFKC + lowercase + collapsed whitespace. */

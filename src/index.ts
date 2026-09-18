@@ -34,6 +34,17 @@ export function estimateTokens(text: string): number {
   return Math.ceil(units / 4);
 }
 
+/** Optional ISO-8601-ish timestamp (≤64 chars) or null. Rejects garbage. */
+function optionalDate(value: unknown, field: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") throw new Error(`${field} must be a string`);
+  const clean = value.trim().slice(0, 64);
+  if (!/^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?)?$/.test(clean)) {
+    throw new Error(`${field} must be an ISO-8601 date string`);
+  }
+  return clean;
+}
+
 /** Slice by code points — never splits surrogate pairs / graphemes. */
 export function sliceCodePoints(text: string, maxChars: number): string {
   return Array.from(text).slice(0, maxChars).join("");
@@ -45,7 +56,8 @@ export function toFtsQuery(query: string): string {
     .normalize("NFKC")
     .split(/[\s"()*^:]+/)
     .flatMap((t) => t.split(/[^\p{L}\p{N}_+-]+/u))
-    .map((t) => t.trim().slice(0, 64))
+    .map((t) => t.replace(/^[+-]+/, "").trim().slice(0, 64))
+    .filter((t) => t.length > 0 && /[\p{L}\p{N}]/u.test(t))
     // Drop 1-char noise, except CJK-ish scripts where 1 char is meaningful.
     .filter((t) => t.length >= 2 || /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]/u.test(t))
     .slice(0, 20);
@@ -95,6 +107,8 @@ export class Brain {
   logEpisode(input: NewEpisode): number {
     const sessionId = requireText(input.sessionId, "sessionId", LIMITS.sessionId);
     const summary = requireText(input.summary, "summary", LIMITS.summary);
+    const startedAt = optionalDate(input.startedAt, "startedAt");
+    const endedAt = optionalDate(input.endedAt, "endedAt");
     const decisions =
       input.decisions === undefined ? null : requireText(input.decisions, "decisions", LIMITS.decisions);
     const outcome =
@@ -105,7 +119,7 @@ export class Brain {
           `INSERT INTO episodes (session_id, started_at, ended_at, summary, decisions, outcome)
            VALUES (?, ?, ?, ?, ?, ?)`
         )
-        .run(sessionId, input.startedAt ?? null, input.endedAt ?? null, summary, decisions, outcome);
+        .run(sessionId, startedAt, endedAt, summary, decisions, outcome);
       return Number(info.lastInsertRowid);
     } catch (err) {
       if (
@@ -139,25 +153,15 @@ export class Brain {
     const confidence = parseConfidence(input.confidence, 0.5);
     const norm = normalizeContent(content);
 
-    const existing = this.db.prepare(`SELECT ${FACT_COLUMNS} FROM facts WHERE content_norm = ?`).get(
-      norm
-    ) as Fact | undefined;
-
-    if (existing) {
-      const merged = Math.min(1, Math.max(0, existing.confidence + (confidence - existing.confidence) * 0.5));
-      const reinf = Math.min(existing.reinforcements + 1, MAX_REINFORCEMENTS);
-      this.db
-        .prepare(
-          `UPDATE facts SET content = ?, content_norm = ?, confidence = ?, reinforcements = ?,
-           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
-        )
-        .run(content, norm, merged, reinf, existing.id);
-      return this.getFact(existing.id) as Fact;
-    }
-
     const info = this.db
       .prepare(
-        "INSERT INTO facts (category, content, content_norm, confidence, source_episode_id) VALUES (?, ?, ?, ?, ?)"
+        `INSERT INTO facts (category, content, content_norm, confidence, source_episode_id)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(content_norm) DO UPDATE SET
+           content = excluded.content,
+           confidence = min(1.0, max(0.0, confidence + (excluded.confidence - confidence) * 0.5)),
+           reinforcements = min(reinforcements + 1, ${MAX_REINFORCEMENTS}),
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
       )
       .run(
         input.category as FactCategory,
@@ -166,7 +170,14 @@ export class Brain {
         confidence,
         input.sourceEpisodeId === undefined ? null : requireId(input.sourceEpisodeId, "sourceEpisodeId")
       );
-    return this.getFact(Number(info.lastInsertRowid)) as Fact;
+    // Merge path (row existed): lastInsertRowid is stale, look up by norm.
+    // Insert path: lastInsertRowid is the new id.
+    const row = this.db.prepare(`SELECT ${FACT_COLUMNS} FROM facts WHERE content_norm = ?`).get(
+      norm
+    ) as Fact | undefined;
+    if (row === undefined) throw new Error("Failed to store fact");
+    void info;
+    return row;
   }
 
   getFact(id: number): Fact | undefined {
@@ -222,27 +233,36 @@ export class Brain {
     const fts = toFtsQuery(query);
     if (fts.length === 0) return [];
     const n = clampLimit(limit, 8, 1, 50);
-    const rows = this.db
+    // One query per table (each LIMIT n): weighting happens in JS AFTER
+    // retrieval, so a rule can never be cut off by a raw cross-table LIMIT.
+    const factRows = this.db
       .prepare(
         `SELECT 'fact' AS kind, f.id AS id, ('[' || f.category || '] ' || substr(f.content, 1, 80)) AS title,
-                snippet(facts_fts, 0, '[[', ']]', '…', 24) AS snippet, rank AS rank
+                snippet(facts_fts, 0, '[[', ']]', '…', 24) AS snippet, bm25(facts_fts) AS rank
          FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid WHERE facts_fts MATCH ?
-         UNION ALL
-         SELECT 'rule', r.id, r.title,
-                snippet(rules_fts, 2, '[[', ']]', '…', 24), rank
+         ORDER BY rank LIMIT ?`
+      )
+      .all(fts, n) as RecallHit[];
+    const ruleRows = this.db
+      .prepare(
+        `SELECT 'rule' AS kind, r.id AS id, r.title AS title,
+                snippet(rules_fts, -1, '[[', ']]', '…', 24) AS snippet, bm25(rules_fts) AS rank
          FROM rules_fts JOIN rules r ON r.id = rules_fts.rowid WHERE rules_fts MATCH ?
-         UNION ALL
-         SELECT 'episode', e.id, ('session ' || e.session_id),
-                snippet(episodes_fts, 0, '[[', ']]', '…', 24), rank
+         ORDER BY rank LIMIT ?`
+      )
+      .all(fts, n) as RecallHit[];
+    const episodeRows = this.db
+      .prepare(
+        `SELECT 'episode' AS kind, e.id AS id, ('session ' || e.session_id) AS title,
+                snippet(episodes_fts, -1, '[[', ']]', '…', 24) AS snippet, bm25(episodes_fts) AS rank
          FROM episodes_fts JOIN episodes e ON e.id = episodes_fts.rowid WHERE episodes_fts MATCH ?
          ORDER BY rank LIMIT ?`
       )
-      .all(fts, fts, fts, n) as RecallHit[];
-    // FTS rank is per-table and negative (lower = better); kind weights
-    // amplify rule matches and damp verbose episodes.
-    return rows
+      .all(fts, n) as RecallHit[];
+    return [...factRows, ...ruleRows, ...episodeRows]
       .map((r) => ({ ...r, rank: r.rank * KIND_WEIGHT[r.kind] }))
-      .sort((a, b) => a.rank - b.rank);
+      .sort((a, b) => a.rank - b.rank)
+      .slice(0, n);
   }
 
   // ---- forget ----
@@ -264,12 +284,17 @@ export class Brain {
     if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || maxTokens < 50) {
       throw new Error("maxTokens must be a finite number >= 50");
     }
-    const sections: string[] = [];
+    // 15% safety margin: estimateTokens is heuristic, real BPE tokenizers
+    // (esp. on Cyrillic/CJK/emoji) may count higher.
+    const budget = Math.floor(maxTokens * 0.85);
+    const blocks: string[] = [];
     let used = 0;
+    // Account for the exact "\n\n" separators join() will insert.
     const pushBlock = (block: string): boolean => {
-      const cost = estimateTokens(block + "\n\n");
-      if (used + cost > maxTokens) return false;
-      sections.push(block);
+      const sep = blocks.length === 0 ? 0 : estimateTokens("\n\n");
+      const cost = estimateTokens(block) + sep;
+      if (used + cost > budget) return false;
+      blocks.push(block);
       used += cost;
       return true;
     };
@@ -279,23 +304,28 @@ export class Brain {
       pushBlock(`## Правила (не нарушать)\n${ruleLines.join("\n")}`);
     }
 
+    // Facts: rebuild the candidate block each iteration (n ≤ 40, cheap)
+    // so the budget check sees the EXACT final string incl. separators.
     const factLines: string[] = [];
+    const factsSep = blocks.length === 0 ? 0 : estimateTokens("\n\n");
     for (const f of this.topFacts(40)) {
-      // SQL-side length guard: never load unbounded text into memory.
+      // Line-level guard: never budget unbounded text.
       const line = sliceCodePoints(`- [${f.category}] ${f.content}`, 300);
-      const extra = factLines.length === 0 ? estimateTokens("## Факты\n") : 0;
-      const cost = estimateTokens(`${line}\n`) + extra;
-      if (used + cost > maxTokens) break;
+      const candidate = `## Факты\n${[...factLines, line].join("\n")}`;
+      if (used + factsSep + estimateTokens(candidate) > budget) break;
       factLines.push(line);
-      used += cost;
     }
-    if (factLines.length > 0) sections.push(`## Факты\n${factLines.join("\n")}`);
+    if (factLines.length > 0) {
+      const block = `## Факты\n${factLines.join("\n")}`;
+      blocks.push(block);
+      used += factsSep + estimateTokens(block);
+    }
 
     for (const e of this.recentEpisodes(3)) {
       const block = `## Прошлая сессия ${sliceCodePoints(e.sessionId, 64)}\n${sliceCodePoints(e.summary, 600)}`;
       if (!pushBlock(block)) break;
     }
-    return sections.join("\n\n");
+    return blocks.join("\n\n");
   }
 }
 

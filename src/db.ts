@@ -161,7 +161,13 @@ export function openDatabase(dbPath: string): Database.Database {
   return db;
 }
 
-/** Flush WAL to the main db file. Call on graceful shutdown for safe backups. */
-export function checkpoint(db: Database.Database): void {
-  db.pragma("wal_checkpoint(TRUNCATE)");
+/** Flush WAL to the main db file. Best-effort: reports busy/locked, never throws. */
+export function checkpoint(db: Database.Database): { status: string } {
+  try {
+    const row = db.pragma("wal_checkpoint(TRUNCATE)") as [{ busy: number; log: number; checkpointed: number }];
+    if (row[0]?.busy !== 0) return { status: "busy" };
+    return { status: "ok" };
+  } catch {
+    return { status: "error" };
+  }
 }
