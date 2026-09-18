@@ -20,6 +20,7 @@ const SECRET_PATTERNS = [
   /ghp_[A-Za-z0-9]+/,
   /:+[A-Za-z0-9_-]{20,}/, // token-like "id:SECRET"
   /пароль/i,
+  /секрет/i,
   /password/i,
   /secret/i,
   /токен/i,
