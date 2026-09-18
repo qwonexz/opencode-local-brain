@@ -8,43 +8,21 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { Brain } from "../src/index.js";
+import { isSecretLike } from "../src/index.js";
 import { sliceCodePoints } from "../src/index.js";
 import type { FactCategory } from "../src/types.js";
 
 const MAX_MEMORY_FILE_BYTES = 1_000_000;
 
-// Lines matching any of these are secrets/credentials — skipped with a warning.
-// NOTE: blocklist, not allowlist — it reduces accidents but cannot catch
-// every obfuscation (leet-speak, split tokens, raw base64). Never migrate
-// files you haven't eyeballed.
-const SECRET_PATTERNS = [
-  /api[\s_-]*hash/i,
-  /api[\s_-]*id/i,
-  /bot[\s_-]*token/i,
-  /access[\s_-]*token/i,
-  /private[\s_-]*key/i,
-  /mnemonic|seed[\s_-]*phrase/i,
-  /passwd|pwd|passwords?/i,
-  /secrets?/i,
-  /токены?/i,
-  /секреты?/i,
-  /пароли?/i,
-  /api[\s_-]*ke+y/i,
-  /auth[\s_-]*token/i,
-  /(^|[\s_.=:|-])tokens?([\s_.=:|-]|s\b|$)/i,
-  /sk-[A-Za-z0-9]{16,}/,
-  /xox[bpas]-/i,
-  /gh[pous]_[A-Za-z0-9]+/,
-  /glpat-[A-Za-z0-9_]+/,
-  /AKIA[0-9A-Z]{16}/,
-  /[=:]\s*[A-Za-z0-9_\-+/]{20,}/, // KEY=... / id:... high-entropy values
-];
+// Secret detection lives in the core (src/secrets.ts) — single source of truth.
+// NOTE: blocklist, not allowlist — reduces accidents but cannot catch every
+// obfuscation. Never migrate files you haven't eyeballed.
 
 const memoryPath = resolve(process.argv[2] ?? join(homedir(), ".config", "opencode", "brain", "memory.md"));
 const dbPath = resolve(process.argv[3] ?? join(homedir(), ".config", "opencode", "brain", "brain.db"));
 
 function isSecret(text: string): boolean {
-  return SECRET_PATTERNS.some((re) => re.test(text));
+  return isSecretLike(text);
 }
 
 function guessCategory(text: string): FactCategory {

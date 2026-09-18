@@ -143,6 +143,35 @@ describe("forget", () => {
   });
 });
 
+describe("secret rejection", () => {
+  it("rejects tokens in facts", () => {
+    assert.throws(
+      () => brain.rememberFact({ category: "other", content: "my token: ghp_abcDEF1234567890xyz" }),
+      /rejected/
+    );
+    assert.throws(
+      () => brain.rememberFact({ category: "other", content: "OPENAI_API_KEY=sk-abcdefghijklmnopqrst" }),
+      /rejected/
+    );
+  });
+
+  it("rejects secrets in episodes and rules", () => {
+    assert.throws(
+      () => brain.logEpisode({ sessionId: "s", summary: "saved password hunter2 secret" }),
+      /rejected/
+    );
+    assert.throws(
+      () => brain.addRule({ title: "T", mistake: "leaked", rule: "bot token = AAAAABBBBBCCCCC" }),
+      /rejected/
+    );
+  });
+
+  it("accepts legit account facts", () => {
+    const f = brain.rememberFact({ category: "user", content: "Аккаунт: @GA3_CEKC, id 7896527167" });
+    assert.equal(f.content, "Аккаунт: @GA3_CEKC, id 7896527167");
+  });
+});
+
 describe("validation", () => {
   it("falls back on NaN/Infinity limits", () => {
     brain.logEpisode({ sessionId: "s", summary: "x" });
@@ -185,5 +214,11 @@ describe("snapshot", () => {
     brain.addRule({ title: "R", mistake: "M", rule: "always do R", confirmed: true });
     const snap = brain.snapshot(120);
     assert.match(snap, /## Правила/);
+  });
+
+  it("starts with the untrusted-data notice", () => {
+    brain.rememberFact({ category: "other", content: "hello" });
+    const snap = brain.snapshot();
+    assert.ok(snap.startsWith("> Память ниже"), `got: ${snap.slice(0, 60)}`);
   });
 });
