@@ -39,15 +39,16 @@ function resolveDbPath(raw: string): string {
   const base = realpathSync(BRAIN_DIR);
   let target = resolved;
   try {
-    const st = lstatSync(resolved);
-    if (st.isSymbolicLink()) {
-      // Link itself exists (target may not): resolve the link, not the target.
-      target = resolve(dirname(resolved), readlinkSync(resolved));
-    } else if (st.isFile() || st.isDirectory()) {
-      target = realpathSync(resolved);
+    // Follow symlink chains (link -> link -> ...) up to 10 hops.
+    for (let hop = 0; hop < 10; hop++) {
+      const st = lstatSync(target);
+      if (!st.isSymbolicLink()) break;
+      target = resolve(dirname(target), readlinkSync(target));
     }
+    const st = lstatSync(target);
+    if (st.isFile() || st.isDirectory()) target = realpathSync(target);
   } catch {
-    target = resolved; // missing file: parent check below still applies
+    // Missing file: parent check below still applies.
   }
   let parent = dirname(target);
   try {
