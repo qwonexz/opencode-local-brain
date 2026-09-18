@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS episodes (
   summary TEXT NOT NULL,
   decisions TEXT,
   outcome TEXT,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
@@ -131,6 +132,13 @@ export function openDatabase(dbPath: string): Database.Database {
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
   db.exec(SCHEMA_SQL);
+  // Lightweight migration: episodes.updated_at added after v1 schema.
+  const cols = db.prepare("PRAGMA table_info(episodes)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "updated_at")) {
+    db.exec(
+      "ALTER TABLE episodes ADD COLUMN updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+    );
+  }
 
   // Atomic version init (safe under concurrent openers).
   db.exec("BEGIN IMMEDIATE");

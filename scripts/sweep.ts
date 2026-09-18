@@ -42,20 +42,24 @@ function main(): void {
   const sessions = JSON.parse(raw) as ListedSession[];
   const now = Date.now();
   const brain = Brain.open(DB_PATH);
-  let known: Set<string>;
+  let freshness: Map<string, number>;
   try {
-    const rows = brain.recentEpisodes(1000);
-    known = new Set(rows.map((r) => r.sessionId));
+    freshness = brain.episodeFreshness();
   } finally {
     brain.close();
   }
 
   let queued = 0;
   for (const s of sessions) {
-    if (typeof s.id !== "string" || !/^ses_[A-Za-z0-9]+$/.test(s.id)) continue;
+    if (typeof s.id !== "string" || !/^ses_[A-Za-z0-9]{1,64}$/.test(s.id)) continue;
     if ((s.title ?? "").startsWith("brain-writer:")) continue;
     if (typeof s.updated === "number" && now - s.updated < ACTIVE_GRACE_MS) continue;
-    if (known.has(s.id)) continue;
+    const loggedAt = freshness.get(s.id);
+    if (loggedAt !== undefined) {
+      // Known session: re-run the writer only if the session changed after logging.
+      if (typeof s.updated !== "number" || s.updated <= loggedAt) continue;
+      log(`re-queue stale episode for ${s.id}`);
+    }
     try {
       const child = spawn("node", [WRITER_JS, s.id], {
         detached: true,

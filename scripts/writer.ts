@@ -11,7 +11,17 @@
  * messages or <200 chars of transcript), missing sessions.
  */
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Brain } from "../src/index.js";
@@ -23,6 +33,9 @@ const DB_PATH = process.env.BRAIN_DB ?? join(BRAIN_DIR, "brain.db");
 const LOG_PATH = join(BRAIN_DIR, "writer.log");
 const WRITER_MODEL = process.env.BRAIN_WRITER_MODEL ?? "opencode/big-pickle";
 const WRITER_TITLE_PREFIX = "brain-writer:";
+const REGISTRY_PATH = join(BRAIN_DIR, "writer-sessions.json");
+const MAX_FACTS_PER_SESSION = 20;
+const MAX_RULES_PER_SESSION = 10;
 
 const MIN_USER_MESSAGES = 2;
 const MIN_TRANSCRIPT_CHARS = 200;
@@ -42,6 +55,47 @@ function run(cmd: string, args: string[], input?: string, timeoutMs = 300_000): 
     input,
     stdio: ["pipe", "pipe", "pipe"],
   });
+}
+
+/**
+ * Secure temp file: O_CREAT|O_EXCL (no symlink following, no clobbering),
+ * mode 0600 (transcripts may contain secrets). Returns path; caller unlinks.
+ */
+function secureTempFile(prefix: string, suffix: string): string {
+  mkdirSync(BRAIN_DIR, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const name = `${prefix}-${process.pid}-${Date.now()}-${attempt}${suffix}`;
+    const full = join(BRAIN_DIR, name);
+    try {
+      const fd = openSync(full, "wx", 0o600);
+      closeSync(fd);
+      return full;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
+  throw new Error("Could not create secure temp file");
+}
+
+/** Remove stale writer temp files left by crashes (kill -9 / reboot). */
+function cleanStaleTempFiles(): void {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(BRAIN_DIR);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const e of entries) {
+    if (!/^(writer|export)-ses_[A-Za-z0-9]+(-\d+){2,3}(\.txt|\.json)?$/.test(e)) continue;
+    const full = join(BRAIN_DIR, e);
+    try {
+      const age = now - statSync(full).mtimeMs;
+      if (age > 60 * 60 * 1000) unlinkSync(full);
+    } catch {
+      // best-effort
+    }
+  }
 }
 
 interface ExportedMessage {
@@ -77,6 +131,30 @@ function extractTranscript(exp: SessionExport): { userMessages: number; text: st
   return { userMessages, text: lines.join("\n").slice(0, MAX_TRANSCRIPT_CHARS) };
 }
 
+/** Registry of temp writer titles (second anti-recursion factor). */
+function loadWriterRegistry(): Set<string> {
+  try {
+    const raw = readFileSync(REGISTRY_PATH, "utf-8");
+    const arr = JSON.parse(raw) as unknown;
+    if (Array.isArray(arr)) return new Set(arr.filter((x): x is string => typeof x === "string"));
+  } catch {
+    // missing/corrupt registry = empty
+  }
+  return new Set();
+}
+
+function registerWriterTitle(title: string): void {
+  try {
+    const reg = loadWriterRegistry();
+    reg.add(title);
+    // cap size: keep last 200
+    const arr = [...reg].slice(-200);
+    writeFileSync(REGISTRY_PATH, JSON.stringify(arr), { encoding: "utf-8", mode: 0o600 });
+  } catch {
+    // best-effort
+  }
+}
+
 function parseWriterJson(raw: string): WriterOutput {
   // opencode run --format json emits event lines; the assistant text holds JSON.
   // Strategy: find the largest {...} block.
@@ -101,7 +179,7 @@ const WRITER_PROMPT = `Ты — писарь локальной памяти о�
  * may contain secrets from the summarized session) don't linger on disk. */
 function cleanupWriterSession(sessionId: string): void {
   try {
-    const raw = run(OPENCODE_BIN, ["session", "list", "--format", "json", "-n", "10"], undefined, 60_000);
+    const raw = run(OPENCODE_BIN, ["session", "list", "--format", "json", "-n", "30"], undefined, 60_000);
     const sessions = JSON.parse(raw) as { id?: string; title?: string }[];
     for (const s of sessions) {
       if (typeof s.id === "string" && s.title === `${WRITER_TITLE_PREFIX} ${sessionId}`) {
@@ -116,9 +194,14 @@ function cleanupWriterSession(sessionId: string): void {
 
 async function main(): Promise<void> {
   const sessionId = process.argv[2];
-  if (!sessionId || !/^ses_[A-Za-z0-9]+$/.test(sessionId)) {
+  if (!sessionId || !/^ses_[A-Za-z0-9]{1,64}$/.test(sessionId)) {
     throw new Error("Usage: writer.js <sessionId> (ses_...)");
   }
+  cleanStaleTempFiles();
+
+  // Second anti-recursion factor (independent of `opencode run --title`):
+  // registry of temp writer titles we created ourselves.
+  const registry = loadWriterRegistry();
 
   // NOTE: no --sanitize here — sanitized transcripts are all [redacted] and
   // useless for summarization. Secrets in the transcript never reach the DB:
@@ -126,7 +209,7 @@ async function main(): Promise<void> {
   // session is deleted right after (cleanupWriterSession).
   // NOTE 2: `opencode export` truncates JSON when stdout is a pipe — redirect
   // to a temp file instead. sessionId is regex-validated, safe to interpolate.
-  const exportTmp = join(BRAIN_DIR, `export-${sessionId}.json`);
+  const exportTmp = secureTempFile("export", ".json");
   try {
     run("bash", ["-c", `'${OPENCODE_BIN}' export '${sessionId}' > '${exportTmp}'`], undefined, 60_000);
     var rawExport = readFileSync(exportTmp, "utf-8");
@@ -139,7 +222,7 @@ async function main(): Promise<void> {
   }
   const exp = JSON.parse(rawExport) as SessionExport;
   const title = exp.info?.title ?? "";
-  if (title.startsWith(WRITER_TITLE_PREFIX)) {
+  if (title.startsWith(WRITER_TITLE_PREFIX) || registry.has(title)) {
     log(`${sessionId}: skipped (own writer session)`);
     return;
   }
@@ -151,12 +234,12 @@ async function main(): Promise<void> {
 
   // Transcript goes via -f attachment (message MUST come first on the CLI,
   // otherwise -f swallows it). The model reads attachments fine.
-  const tmp = join(BRAIN_DIR, `writer-${sessionId}.txt`);
-  writeFileSync(tmp, `${WRITER_PROMPT}\n\n--- ТРАНСКРИПТ ---\n${text}`, "utf-8");
+  const tmp = secureTempFile("writer", ".txt");
+  writeFileSync(tmp, `${WRITER_PROMPT}\n\n--- ТРАНСКРИПТ ---\n${text}`, { encoding: "utf-8", mode: 0o600 });
   let out: string;
   try {
     out = run(
-      "opencode",
+      OPENCODE_BIN,
       [
         "run",
         "Резюмируй приложенный файл с транскриптом строго по схеме JSON из него. Ответ — только JSON.",
@@ -170,6 +253,7 @@ async function main(): Promise<void> {
       undefined,
       300_000
     );
+    registerWriterTitle(`${WRITER_TITLE_PREFIX} ${sessionId}`);
   } finally {
     try {
       unlinkSync(tmp);
@@ -179,6 +263,12 @@ async function main(): Promise<void> {
   }
 
   const data = parseWriterJson(out);
+  // Strip prototype-pollution keys from model output before use.
+  if (data && typeof data === "object") {
+    for (const k of ["__proto__", "constructor", "prototype"]) delete (data as Record<string, unknown>)[k];
+    if (Array.isArray(data.facts)) data.facts = data.facts.slice(0, MAX_FACTS_PER_SESSION);
+    if (Array.isArray(data.mistakes)) data.mistakes = data.mistakes.slice(0, MAX_RULES_PER_SESSION);
+  }
   cleanupWriterSession(sessionId);
   if (!data.summary || typeof data.summary !== "string") {
     throw new Error("Writer produced no summary");
