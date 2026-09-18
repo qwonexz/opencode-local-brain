@@ -35,6 +35,17 @@ describe("episodes (L1)", () => {
   it("rejects empty summary", () => {
     assert.throws(() => brain.logEpisode({ sessionId: "s", summary: "  " }), /must not be empty/);
   });
+
+  it("upserts: creates then refreshes", () => {
+    const a = brain.upsertEpisode({ sessionId: "u1", summary: "first" });
+    assert.equal(a.created, true);
+    const b = brain.upsertEpisode({ sessionId: "u1", summary: "second version" });
+    assert.equal(b.created, false);
+    assert.equal(b.id, a.id);
+    assert.equal(brain.recentEpisodes()[0]?.summary, "second version");
+    // refreshed content is searchable (episodes_au trigger)
+    assert.ok(brain.recall("second version").some((h) => h.kind === "episode"));
+  });
 });
 
 describe("facts (L2)", () => {

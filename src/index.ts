@@ -138,8 +138,42 @@ export class Brain {
     }
   }
 
-  recentEpisodes(limit = 5): { id: number; sessionId: string; summary: string }[] {
-    const n = clampLimit(limit, 5, 1, 50);
+  /**
+   * Insert or refresh an episode by session_id. Refresh keeps FTS in sync
+   * via the episodes_au trigger. Used by the writer daemon on every idle
+   * event so long sessions converge instead of duplicating.
+   */
+  upsertEpisode(input: NewEpisode): { id: number; created: boolean } {
+    const sessionId = requireText(input.sessionId, "sessionId", LIMITS.sessionId);
+    const summary = requireText(input.summary, "summary", LIMITS.summary);
+    assertNoSecrets(sessionId, "sessionId");
+    assertNoSecrets(summary, "summary");
+    const startedAt = optionalDate(input.startedAt, "startedAt");
+    const endedAt = optionalDate(input.endedAt, "endedAt");
+    const decisions =
+      input.decisions === undefined ? null : requireText(input.decisions, "decisions", LIMITS.decisions);
+    if (decisions !== null) assertNoSecrets(decisions, "decisions");
+    const outcome =
+      input.outcome === undefined ? null : requireText(input.outcome, "outcome", LIMITS.outcome);
+    if (outcome !== null) assertNoSecrets(outcome, "outcome");
+
+    const existing = this.db
+      .prepare("SELECT id FROM episodes WHERE session_id = ?")
+      .get(sessionId) as { id: number } | undefined;
+    if (existing === undefined) {
+      return { id: this.logEpisode(input), created: true };
+    }
+    this.db
+      .prepare(
+        `UPDATE episodes SET summary = ?, decisions = ?, outcome = ?,
+         started_at = COALESCE(?, started_at), ended_at = COALESCE(?, ended_at)
+         WHERE session_id = ?`
+      )
+      .run(summary, decisions, outcome, startedAt, endedAt, sessionId);
+    return { id: existing.id, created: false };
+  }
+
+  recentEpisodes(limit = 5): { id: number; sessionId: string; summary: string }[] {    const n = clampLimit(limit, 5, 1, 50);
     return this.db
       .prepare("SELECT id, session_id AS sessionId, summary FROM episodes ORDER BY id DESC LIMIT ?")
       .all(n) as { id: number; sessionId: string; summary: string }[];
