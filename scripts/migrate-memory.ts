@@ -31,10 +31,12 @@ const SECRET_PATTERNS = [
   /пароли?/i,
   /api[\s_-]*ke+y/i,
   /auth[\s_-]*token/i,
-  /(^|[\s_.-])tokens?([\s_.-]|s\b|$)/i,
+  /(^|[\s_.=:|-])tokens?([\s_.=:|-]|s\b|$)/i,
   /sk-[A-Za-z0-9]{16,}/,
   /xox[bpas]-/i,
-  /github_pat_[A-Za-z0-9_]+/,
+  /gh[pous]_[A-Za-z0-9]+/,
+  /glpat-[A-Za-z0-9_]+/,
+  /AKIA[0-9A-Z]{16}/,
   /[=:]\s*[A-Za-z0-9_\-+/]{20,}/, // KEY=... / id:... high-entropy values
 ];
 

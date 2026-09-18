@@ -169,6 +169,7 @@ export function checkpoint(db: Database.Database): { status: string } {
       | { busy: number }
       | { busy: number }[];
     const row = Array.isArray(res) ? res[0] : res;
+    if (row === undefined) return { status: "ok" };
     if (row?.busy !== 0) return { status: "busy" };
     return { status: "ok" };
   } catch {
