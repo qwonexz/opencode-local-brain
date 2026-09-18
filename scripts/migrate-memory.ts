@@ -29,9 +29,13 @@ const SECRET_PATTERNS = [
   /токены?/i,
   /секреты?/i,
   /пароли?/i,
-  /ghp_[A-Za-z0-9]+/,
-  /gho_[A-Za-z0-9]+/,
-  /:+[A-Za-z0-9_-]{20,}/, // token-like "id:SECRET"
+  /api[\s_-]*ke+y/i,
+  /auth[\s_-]*token/i,
+  /(^|[\s_.-])tokens?([\s_.-]|s\b|$)/i,
+  /sk-[A-Za-z0-9]{16,}/,
+  /xox[bpas]-/i,
+  /github_pat_[A-Za-z0-9_]+/,
+  /[=:]\s*[A-Za-z0-9_\-+/]{20,}/, // KEY=... / id:... high-entropy values
 ];
 
 const memoryPath = resolve(process.argv[2] ?? join(homedir(), ".config", "opencode", "brain", "memory.md"));

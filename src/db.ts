@@ -164,8 +164,12 @@ export function openDatabase(dbPath: string): Database.Database {
 /** Flush WAL to the main db file. Best-effort: reports busy/locked, never throws. */
 export function checkpoint(db: Database.Database): { status: string } {
   try {
-    const row = db.pragma("wal_checkpoint(TRUNCATE)") as [{ busy: number; log: number; checkpointed: number }];
-    if (row[0]?.busy !== 0) return { status: "busy" };
+    // better-sqlite3 returns an object for single-row pragmas, array otherwise.
+    const res = db.pragma("wal_checkpoint(TRUNCATE)") as
+      | { busy: number }
+      | { busy: number }[];
+    const row = Array.isArray(res) ? res[0] : res;
+    if (row?.busy !== 0) return { status: "busy" };
     return { status: "ok" };
   } catch {
     return { status: "error" };

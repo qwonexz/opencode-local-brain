@@ -153,30 +153,27 @@ export class Brain {
     const confidence = parseConfidence(input.confidence, 0.5);
     const norm = normalizeContent(content);
 
-    const info = this.db
+    const row = this.db
       .prepare(
         `INSERT INTO facts (category, content, content_norm, confidence, source_episode_id)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(content_norm) DO UPDATE SET
            content = excluded.content,
            confidence = min(1.0, max(0.0, confidence + (excluded.confidence - confidence) * 0.5)),
-           reinforcements = min(reinforcements + 1, ${MAX_REINFORCEMENTS}),
-           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
+           reinforcements = min(reinforcements + 1, ?),
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         RETURNING ${FACT_COLUMNS}`
       )
-      .run(
+      .get(
         input.category as FactCategory,
         content,
         norm,
         confidence,
-        input.sourceEpisodeId === undefined ? null : requireId(input.sourceEpisodeId, "sourceEpisodeId")
-      );
-    // Merge path (row existed): lastInsertRowid is stale, look up by norm.
-    // Insert path: lastInsertRowid is the new id.
-    const row = this.db.prepare(`SELECT ${FACT_COLUMNS} FROM facts WHERE content_norm = ?`).get(
-      norm
-    ) as Fact | undefined;
+        input.sourceEpisodeId === undefined ? null : requireId(input.sourceEpisodeId, "sourceEpisodeId"),
+        MAX_REINFORCEMENTS
+      ) as Fact | undefined;
+    // Atomic upsert: exactly one row is always returned (insert or merge path).
     if (row === undefined) throw new Error("Failed to store fact");
-    void info;
     return row;
   }
 
