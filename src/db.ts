@@ -1,4 +1,6 @@
 import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { SCHEMA_VERSION } from "./types.js";
 
 const SCHEMA_SQL = `
@@ -34,10 +36,20 @@ CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
   VALUES ('delete', old.id, old.summary, COALESCE(old.decisions, ''), COALESCE(old.outcome, ''));
 END;
 
+CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE OF summary, decisions, outcome ON episodes
+WHEN old.summary IS NOT new.summary OR old.decisions IS NOT new.decisions OR old.outcome IS NOT new.outcome
+BEGIN
+  INSERT INTO episodes_fts(episodes_fts, rowid, summary, decisions, outcome)
+  VALUES ('delete', old.id, old.summary, COALESCE(old.decisions, ''), COALESCE(old.outcome, ''));
+  INSERT INTO episodes_fts(rowid, summary, decisions, outcome)
+  VALUES (new.id, new.summary, COALESCE(new.decisions, ''), COALESCE(new.outcome, ''));
+END;
+
 CREATE TABLE IF NOT EXISTS facts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   category TEXT NOT NULL,
-  content TEXT NOT NULL UNIQUE,
+  content TEXT NOT NULL,
+  content_norm TEXT NOT NULL UNIQUE,
   confidence REAL NOT NULL DEFAULT 0.5,
   source_episode_id INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
   reinforcements INTEGER NOT NULL DEFAULT 1,
@@ -60,7 +72,9 @@ CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
   INSERT INTO facts_fts(facts_fts, rowid, content) VALUES ('delete', old.id, old.content);
 END;
 
-CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE OF content ON facts BEGIN
+CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts
+WHEN old.content IS NOT new.content
+BEGIN
   INSERT INTO facts_fts(facts_fts, rowid, content) VALUES ('delete', old.id, old.content);
   INSERT INTO facts_fts(rowid, content) VALUES (new.id, new.content);
 END;
@@ -91,27 +105,63 @@ CREATE TRIGGER IF NOT EXISTS rules_ad AFTER DELETE ON rules BEGIN
   INSERT INTO rules_fts(rules_fts, rowid, title, mistake, rule, triggers)
   VALUES ('delete', old.id, old.title, old.mistake, old.rule, COALESCE(old.triggers, ''));
 END;
+
+CREATE TRIGGER IF NOT EXISTS rules_au AFTER UPDATE OF title, mistake, rule, triggers ON rules
+WHEN old.title IS NOT new.title OR old.mistake IS NOT new.mistake
+  OR old.rule IS NOT new.rule OR old.triggers IS NOT new.triggers
+BEGIN
+  INSERT INTO rules_fts(rules_fts, rowid, title, mistake, rule, triggers)
+  VALUES ('delete', old.id, old.title, old.mistake, old.rule, COALESCE(old.triggers, ''));
+  INSERT INTO rules_fts(rowid, title, mistake, rule, triggers)
+  VALUES (new.id, new.title, new.mistake, new.rule, COALESCE(new.triggers, ''));
+END;
 `;
 
 export function openDatabase(dbPath: string): Database.Database {
-  const db = new Database(dbPath);
+  if (typeof dbPath !== "string" || dbPath.trim().length === 0) {
+    throw new Error("dbPath must be a non-empty string");
+  }
+  const inMemory = dbPath === ":memory:";
+  const resolved = inMemory ? dbPath : resolve(dbPath);
+  if (!inMemory) {
+    mkdirSync(dirname(resolved), { recursive: true });
+  }
+  const db = new Database(resolved);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
+  db.pragma("busy_timeout = 5000");
   db.exec(SCHEMA_SQL);
 
-  const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
-    | { value: string }
-    | undefined;
-  if (row === undefined) {
-    db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(
-      String(SCHEMA_VERSION)
-    );
-  } else if (Number(row.value) !== SCHEMA_VERSION) {
+  // Atomic version init (safe under concurrent openers).
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
+      | { value: string }
+      | undefined;
+    if (row === undefined) {
+      db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(
+        String(SCHEMA_VERSION)
+      );
+    } else if (row.value !== String(SCHEMA_VERSION)) {
+      throw new Error(
+        `Unsupported brain schema version: '${row.value}' (code supports ${SCHEMA_VERSION}). ` +
+          `Migrate or delete the database file.`
+      );
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // ignore rollback errors after a failed BEGIN
+    }
     db.close();
-    throw new Error(
-      `Unsupported brain schema version: ${row.value} (code supports ${SCHEMA_VERSION}). ` +
-        `Migrate or delete the database file.`
-    );
+    throw err;
   }
   return db;
+}
+
+/** Flush WAL to the main db file. Call on graceful shutdown for safe backups. */
+export function checkpoint(db: Database.Database): void {
+  db.pragma("wal_checkpoint(TRUNCATE)");
 }

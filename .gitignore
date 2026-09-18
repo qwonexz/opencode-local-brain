@@ -3,4 +3,8 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+*.sqlite*
+memory.md
+brain.db*
 *.log

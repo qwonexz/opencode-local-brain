@@ -38,12 +38,19 @@ describe("episodes (L1)", () => {
 });
 
 describe("facts (L2)", () => {
-  it("remembers and reinforces duplicates", () => {
-    const a = brain.rememberFact({ category: "user", content: "likes dark mode" });
-    assert.equal(a.confidence, 0.5);
-    const b = brain.rememberFact({ category: "user", content: "likes dark mode", confidence: 0.9 });
+  it("remembers and merges duplicates halfway", () => {
+    const a = brain.rememberFact({ category: "user", content: "likes dark mode", confidence: 0.4 });
+    assert.equal(a.confidence, 0.4);
+    const b = brain.rememberFact({ category: "user", content: "likes dark mode", confidence: 1 });
     assert.equal(b.id, a.id);
-    assert.equal(b.confidence, 0.9);
+    assert.ok(Math.abs(b.confidence - 0.7) < 1e-9, `got ${b.confidence}`);
+    assert.equal(b.reinforcements, 2);
+  });
+
+  it("dedups case/whitespace variants", () => {
+    const a = brain.rememberFact({ category: "other", content: "Hello  World" });
+    const b = brain.rememberFact({ category: "other", content: "hello world" });
+    assert.equal(a.id, b.id);
     assert.equal(b.reinforcements, 2);
   });
 
@@ -57,6 +64,26 @@ describe("facts (L2)", () => {
   it("clamps confidence", () => {
     const f = brain.rememberFact({ category: "other", content: "c", confidence: 99 });
     assert.equal(f.confidence, 1);
+  });
+
+  it("rejects NaN confidence and non-string content", () => {
+    assert.throws(() => brain.rememberFact({ category: "other", content: "x", confidence: NaN }), /finite/);
+    assert.throws(() => brain.rememberFact({ category: "other", content: 42 as never }), /must be a string/);
+  });
+
+  it("rejects oversized content", () => {
+    assert.throws(
+      () => brain.rememberFact({ category: "other", content: "x".repeat(9000) }),
+      /exceeds/
+    );
+  });
+
+  it("episode delete nulls fact source, fact survives", () => {
+    const ep = brain.logEpisode({ sessionId: "s1", summary: "work" });
+    const f = brain.rememberFact({ category: "other", content: "linked", sourceEpisodeId: ep });
+    assert.equal(f.sourceEpisodeId, ep);
+    assert.equal(brain.forget("episode", ep), true);
+    assert.equal(brain.getFact(f.id)?.sourceEpisodeId, null);
   });
 });
 
@@ -81,6 +108,30 @@ describe("recall", () => {
   it("returns empty on blank query", () => {
     assert.deepEqual(brain.recall("   "), []);
   });
+
+  it("survives FTS special characters without SQLITE_ERROR", () => {
+    brain.rememberFact({ category: "other", content: "note about (parens) and *stars*" });
+    for (const q of [`"quoted"`, "(a OR b)", "a*b", "col:test", "^caret", "a+b-c"]) {
+      brain.recall(q); // must not throw
+    }
+  });
+
+  it("finds cyrillic content", () => {
+    brain.rememberFact({ category: "user", content: "пользователь любит тёмную тему" });
+    const hits = brain.recall("тёмную тему");
+    assert.ok(hits.some((h) => h.kind === "fact"));
+  });
+
+  it("boosts rules above verbose episodes", () => {
+    brain.logEpisode({
+      sessionId: "e1",
+      summary: "very long episode about deploy deploy deploy ".repeat(50),
+    });
+    brain.addRule({ title: "Deploy", mistake: "rushed deploy", rule: "always deploy", confirmed: true });
+    const hits = brain.recall("deploy");
+    assert.ok(hits.length > 0);
+    assert.equal(hits[0]?.kind, "rule");
+  });
 });
 
 describe("forget", () => {
@@ -92,6 +143,26 @@ describe("forget", () => {
   });
 });
 
+describe("validation", () => {
+  it("falls back on NaN/Infinity limits", () => {
+    brain.logEpisode({ sessionId: "s", summary: "x" });
+    assert.equal(brain.recentEpisodes(NaN).length, 1);
+    assert.equal(brain.topFacts(Infinity).length, 0);
+    assert.deepEqual(brain.recall("x", NaN).length >= 0, true);
+  });
+
+  it("rejects invalid ids", () => {
+    assert.throws(() => brain.getFact(0), /positive integer/);
+    assert.throws(() => brain.forget("fact", -3), /positive integer/);
+    assert.throws(() => brain.confirmRule(1.5), /positive integer/);
+    assert.throws(() => brain.forget("nope" as never, 1), /Unknown memory kind/);
+  });
+
+  it("snapshot rejects tiny budgets", () => {
+    assert.throws(() => brain.snapshot(10), />= 50/);
+  });
+});
+
 describe("snapshot", () => {
   it("stays within token budget", () => {
     for (let i = 0; i < 100; i++) {
@@ -100,5 +171,19 @@ describe("snapshot", () => {
     const snap = brain.snapshot(500);
     assert.ok(estimateTokens(snap) <= 500, `snapshot exceeded budget: ${estimateTokens(snap)}`);
     assert.match(snap, /## Факты/);
+  });
+
+  it("stays within budget on cyrillic content", () => {
+    for (let i = 0; i < 60; i++) {
+      brain.rememberFact({ category: "other", content: `факт номер ${i} с довольно длинным текстом для проверки` });
+    }
+    const snap = brain.snapshot(500);
+    assert.ok(estimateTokens(snap) <= 500, `cyrillic snapshot exceeded budget: ${estimateTokens(snap)}`);
+  });
+
+  it("prioritizes confirmed rules first", () => {
+    brain.addRule({ title: "R", mistake: "M", rule: "always do R", confirmed: true });
+    const snap = brain.snapshot(120);
+    assert.match(snap, /## Правила/);
   });
 });
