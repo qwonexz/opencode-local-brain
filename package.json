@@ -4,6 +4,9 @@
   "description": "Local layered memory (L1 episodic / L2 semantic / L3 rules) for opencode agents. SQLite + FTS5, vector-ready.",
   "type": "module",
   "license": "MIT",
+  "bin": {
+    "brain-mcp": "dist/src/mcp.js"
+  },
   "scripts": {
     "clean": "rm -rf dist",
     "build": "npm run clean && tsc",
@@ -14,11 +17,13 @@
     "node": ">=22"
   },
   "dependencies": {
-    "better-sqlite3": "^12.2.0"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "better-sqlite3": "^12.2.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
     "@types/better-sqlite3": "^7.6.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
   }
 }
